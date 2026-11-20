@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Least-privilege IAM Identity Center permission sets for the Vehiql course team.
+
+Parameters:
+  IdentityCenterInstanceArn:
+    Type: String
+    Description: IAM Identity Center instance ARN in this AWS organization/account.
+    AllowedPattern: "^arn:aws(-[a-z]{1,5}){0,3}:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$"
+  ExistingImageBucketName:
+    Type: String
+    Description: Existing private Vehiql image bucket.
+  ApplicationInstanceId:
+    Type: String
+    Description: Existing Vehiql EC2 instance ID.
+    AllowedPattern: "^i-[0-9a-f]+$"
+
+Resources:
+  Dev1InfrastructurePermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      Name: vehiql-dev1-infrastructure
+      Description: Inspect Vehiql compute/network infrastructure and operate only its app instance.
+      SessionDuration: PT1H
+      InlinePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InspectComputeNetworkAndElasticIp
+            Effect: Allow
+            Action:
+              - ec2:DescribeAddresses
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceStatus
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeNetworkAcls
+              - ec2:DescribeRouteTables
+              - ec2:DescribeSecurityGroupRules
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSubnets
+              - ec2:DescribeTags
+              - ec2:DescribeVolumes
+              - ec2:DescribeVpcs
+            Resource: "*"
+          - Sid: ReadOnlyTheApplicationStack
+            Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:ListStackResources
+            Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/vehiql-marketplace/*"
+          - Sid: OperateOnlyTheApplicationInstance
+            Effect: Allow
+            Action:
+              - ec2:StartInstances
+              - ec2:StopInstances
+              - ec2:RebootInstances
+            Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${ApplicationInstanceId}"
+
+  Dev2DatabasePermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      Name: vehiql-dev2-database
+      Description: Inspect RDS and access only car-image objects; no database credentials.
+      SessionDuration: PT1H
+      InlinePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadRdsMetadata
+            Effect: Allow
+            Action:
+              - rds:DescribeDBInstances
+              - rds:DescribeDBSnapshots
+              - rds:ListTagsForResource
+            Resource: "*"
+          - Sid: ReadNetworkMetadataForDatabaseConnectivity
+            Effect: Allow
+            Action:
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSubnets
+              - ec2:DescribeVpcs
+            Resource: "*"
+          - Sid: ListCarImageObjects
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${ExistingImageBucketName}"
+            Condition:
+              StringLike:
+                s3:prefix:
+                  - cars
+                  - cars/*
+          - Sid: ReadAndUploadCarImages
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${ExistingImageBucketName}/cars/*"
+
+  Dev3AiPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      Name: vehiql-dev3-ai
+      Description: Invoke Vehiql image analysis and inspect Parameter Store metadata without reading values.
+      SessionDuration: PT1H
+      InlinePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InvokeVehiqlImageAnalysisModel
+            Effect: Allow
+            Action:
+              - bedrock:Converse
+              - bedrock:InvokeModel
+            Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
+          - Sid: ListCarImageObjects
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${ExistingImageBucketName}"
+            Condition:
+              StringLike:
+                s3:prefix:
+                  - cars
+                  - cars/*
+          - Sid: ReadAndUploadCarImages
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${ExistingImageBucketName}/cars/*"
+          - Sid: InspectParameterStoreMetadataOnly
+            Effect: Allow
+            Action:
+              - ssm:DescribeParameters
+            Resource: "*"
+
+  Dev4OperationsPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      InstanceArn: !Ref IdentityCenterInstanceArn
+      Name: vehiql-dev4-operations
+      Description: Inspect Vehiql SSM status, CloudWatch metrics, stack, and app-role policies.
+      SessionDuration: PT1H
+      InlinePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadSystemsManagerInstanceStatus
+            Effect: Allow
+            Action:
+              - ssm:DescribeInstanceInformation
+            Resource: "*"
+          - Sid: ReadCloudWatchMetricsAndAlarms
+            Effect: Allow
+            Action:
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:GetMetricData
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:ListMetrics
+            Resource: "*"
+          - Sid: ReadOnlyTheApplicationStack
+            Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:ListStackResources
+            Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/vehiql-marketplace/*"
+          - Sid: ReadOnlyTheApplicationIamRole
+            Effect: Allow
+            Action:
+              - iam:GetRole
+              - iam:GetRolePolicy
+              - iam:ListAttachedRolePolicies
+              - iam:ListRolePolicies
+            Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/vehiql-app-${AWS::Region}"
+
+Outputs:
+  Dev1InfrastructurePermissionSetArn:
+    Value: !GetAtt Dev1InfrastructurePermissionSet.PermissionSetArn
+  Dev2DatabasePermissionSetArn:
+    Value: !GetAtt Dev2DatabasePermissionSet.PermissionSetArn
+  Dev3AiPermissionSetArn:
+    Value: !GetAtt Dev3AiPermissionSet.PermissionSetArn
+  Dev4OperationsPermissionSetArn:
+    Value: !GetAtt Dev4OperationsPermissionSet.PermissionSetArn

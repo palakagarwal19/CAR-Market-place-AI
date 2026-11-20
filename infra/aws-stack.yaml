@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Vehiql application resources using the existing RDS and S3 bucket.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing default VPC ID.
+  AppSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Default VPC subnet with available EC2 instance capacity.
+  ExistingImageBucketName:
+    Type: String
+    Description: Name of the existing private S3 bucket to reuse.
+  ExistingDatabaseSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group attached to the existing private RDS instance.
+  ExistingDatabaseEndpoint:
+    Type: String
+    Description: Endpoint of the existing private RDS instance.
+  AppInstanceType:
+    Type: String
+    Default: t8i.micro
+    AllowedValues:
+      - t8i.micro
+      - t8i.small
+Resources:
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP web traffic and outbound application traffic.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: vehiql-app
+
+  AppHttpFromInternet:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      CidrIp: 0.0.0.0/0
+      Description: Direct public HTTP access to Next.js for the course-project demo.
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow PostgreSQL from the application instance only.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: vehiql-database
+
+  DatabaseIngressFromApp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ExistingDatabaseSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+      Description: PostgreSQL access from the application instance only.
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "vehiql-app-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: VehiqlRuntimeAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ImageStorage
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${ExistingImageBucketName}/cars/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${ExistingImageBucketName}/deploy/*"
+              - Sid: RuntimeConfiguration
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/vehiql/*"
+              - Sid: DecryptRuntimeConfiguration
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+                    kms:CallerAccount: !Ref AWS::AccountId
+              - Sid: BedrockImageAnalysis
+                Effect: Allow
+                Action:
+                  - bedrock:Converse
+                  - bedrock:InvokeModel
+                Resource: "*"
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AppRole
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}"
+      InstanceType: !Ref AppInstanceType
+      IamInstanceProfile: !Ref AppInstanceProfile
+      SubnetId: !Ref AppSubnetId
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y curl nginx snapd unzip
+          curl --fail --location --silent --show-error https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip --output /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install
+          rm -rf /tmp/aws /tmp/awscliv2.zip
+          snap install node --channel=22/stable --classic
+          fallocate -l 2G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+          mkdir -p /opt/vehiql /etc/vehiql
+          chown ubuntu:ubuntu /opt/vehiql
+          if ! snap list amazon-ssm-agent >/dev/null 2>&1; then
+            snap install amazon-ssm-agent --classic
+          fi
+          snap start --enable amazon-ssm-agent
+          cat > /etc/nginx/sites-available/default <<'NGINX'
+          server {
+            listen 80 default_server;
+            server_name _;
+            location / {
+              proxy_pass http://127.0.0.1:3000;
+              proxy_http_version 1.1;
+              proxy_set_header Host $host;
+              proxy_set_header X-Forwarded-Host $http_x_forwarded_host;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+            }
+          }
+          NGINX
+          cat > /etc/systemd/system/vehiql.service <<'UNIT'
+          [Unit]
+          Description=Vehiql Next.js application
+          After=network.target nginx.service
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          WorkingDirectory=/opt/vehiql
+          EnvironmentFile=/etc/vehiql/app.env
+          Environment=NODE_ENV=production
+          Environment=PATH=/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          ExecStart=/snap/bin/npm start
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now nginx
+      Tags:
+        - Key: Name
+          Value: vehiql-app
+
+  AppElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref AppInstance
+      Tags:
+        - Key: Name
+          Value: vehiql-app
+
+Outputs:
+  ApplicationInstanceId:
+    Description: EC2 instance managed through Systems Manager Session Manager.
+    Value: !Ref AppInstance
+  ApplicationPublicIp:
+    Description: Public IPv4 address for the course-project demo.
+    Value: !Ref AppElasticIp
+  ImageBucketName:
+    Value: !Ref ExistingImageBucketName
+  DatabaseEndpoint:
+    Value: !Ref ExistingDatabaseEndpoint
+  ApplicationUrl:
+    Value: !Sub "http://${AppElasticIp}:3000"
